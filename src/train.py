@@ -12,12 +12,21 @@ import random
 # 1. MEJORA V3: CONSISTENCIA (REPRODUCIBILIDAD)
 # ==========================================
 def set_seeds(seed=42):
+    # 1. Variables de Entorno (Deben ir ANTES de cualquier operación de TF)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+    
+    # 2. Semillas de Librerías
     np.random.seed(seed)
     tf.random.set_seed(seed)
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # 3. Forzar un solo hilo (Opcional, pero garantiza 100% igualdad)
+    # tf.config.threading.set_inter_op_parallelism_threads(1)
+    # tf.config.threading.set_intra_op_parallelism_threads(1)
 
-set_seeds()
+set_seeds(42)
 
 def train_model():
     # 2. Carga de datos

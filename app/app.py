@@ -5,270 +5,296 @@ import yfinance as yf
 import plotly.graph_objects as go
 from sklearn.preprocessing import RobustScaler
 import os
+import json
 from datetime import datetime
-from plotly.subplots import make_subplots
 import pandas_ta as ta
-
-# 1. INICIALIZACIÓN DE SESIÓN (BITÁCORAS CORTAS)
-if 'bitacora_individual' not in st.session_state:
-    st.session_state.bitacora_individual = []
-
-# 2. CONFIGURACIÓN DE ESTABILIDAD TF
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import tensorflow as tf
+import random
 
-try:
-    tf.config.set_visible_devices([], 'GPU')
-    tf.config.threading.set_intra_op_parallelism_threads(1)
-    tf.config.threading.set_inter_op_parallelism_threads(1)
-except: pass
+# --- MEJORA V3: REPRODUCIBILIDAD ---
+np.random.seed(42)
+random.seed(42)
+tf.random.set_seed(42)
 
-# 3. CARGA DEL COMITÉ (V6)
-MODELS_DIR = 'models_v6'
-model_names = ["m1_puro", "m2_volatilidad", "m3_tendencia", "m4_memoria", "m5_agresivo"]
-model_committee = []
+# --- CONFIGURACIÓN AMBIENTE ---
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
-for name in model_names:
-    path = os.path.join(MODELS_DIR, f"{name}.keras")
-    if os.path.exists(path):
-        try: 
-            model = tf.keras.models.load_model(path)
-            model_committee.append(model)
-        except: pass
+st.set_page_config(page_title="StockAI V6_Beta PRO", layout="wide")
 
-# 4. FUNCIONES DE DATOS
+# --- GESTIÓN DE SESGO (BIAS MEMORY) ---
+BIAS_FILE = "bias_memory.json"
+
+# --- BUSCA Y REEMPLAZA ESTAS FUNCIONES ---
+def load_bias():
+    if os.path.exists(BIAS_FILE):
+        try:
+            with open(BIAS_FILE, "r") as f:
+                return json.load(f)
+        except: return {}
+    return {}
+
+def save_bias(ticker, error_percent, tf_key):
+    bias_data = load_bias()
+    composite_key = f"{ticker}_{tf_key}" # LA CLAVE DEL ÉXITO: Ticker + Marco Temporal
+    
+    current_bias = bias_data.get(composite_key, 0.0)
+    alpha_map = {"Daily": 0.20, "Weekly": 0.10, "Monthly": 0.05}
+    alpha = alpha_map.get(tf_key, 0.10)
+    
+    new_bias = (current_bias * (1 - alpha)) + (error_percent * alpha)
+    bias_data[composite_key] = round(new_bias, 4)
+    
+    with open(BIAS_FILE, "w") as f:
+        json.dump(bias_data, f)
+
+def get_current_bias(ticker, tf_key):
+    bias_data = load_bias()
+    return bias_data.get(f"{ticker}_{tf_key}", 0.0)
+
+def actualizar_memoria_errores():
+    """Sincroniza el historial de predicciones con los cierres reales"""
+    if not st.session_state.historial_consultas.empty:
+        # Quitamos duplicados para no procesar el mismo par Ticker_TF varias veces
+        hist = st.session_state.historial_consultas.drop_duplicates(subset=['Activo', 'TF'], keep='first')
+        
+        for _, row in hist.iterrows():
+            df_now = get_data(row['Activo'], row['TF'])
+            if not df_now.empty:
+                real = df_now['Close'].iloc[-1]
+                # Comparamos la predicción guardada vs el cierre actual de Yahoo Finance
+                err = ((row['Predicción'] - real) / real) * 100
+                save_bias(row['Activo'], err, row['TF'])
+        st.sidebar.success(f"✅ Memoria D/W/M actualizada")
+
+# --- INICIALIZACIÓN DE MEMORIA (HISTORIAL) ---
+if 'historial_consultas' not in st.session_state:
+    st.session_state.historial_consultas = pd.DataFrame(columns=[
+        "Fecha", "Activo", "TF", "Precio", "Predicción", "Dirección", "Potencial %", "Acuerdo %"
+    ])
+
+# --- CARGA DE MODELOS ---
+MODELS_DIR = 'models_v6_beta'
+if not os.path.exists(MODELS_DIR):
+    MODELS_DIR = os.path.join('app', 'models_v6_beta')
+
+@st.cache_resource
+def get_v6_models():
+    committee = {}
+    model_names = ["m1_puro", "m2_volatilidad", "m3_tendencia", "m4_memoria", "m5_agresivo"]
+    for name in model_names:
+        p = os.path.join(MODELS_DIR, f"{name}.keras")
+        if os.path.exists(p):
+            try:
+                committee[name] = tf.keras.models.load_model(p, compile=False)
+            except: pass
+    return committee
+
+expertos_dict = get_v6_models()
+
+# --- CORE FUNCTIONS ---
 def get_data(ticker, timeframe):
-    period_map = {"Daily": "10y", "Weekly": "max", "Monthly": "max"}
-    interval_map = {"Daily": "1d", "Weekly": "1wk", "Monthly": "1mo"}
+    p_map = {"Daily": "10y", "Weekly": "max", "Monthly": "max"}
+    i_map = {"Daily": "1d", "Weekly": "1wk", "Monthly": "1mo"}
     try:
-        df = yf.download(ticker, period=period_map[timeframe], interval=interval_map[timeframe], progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = yf.download(ticker, period=p_map[timeframe], interval=i_map[timeframe], progress=False)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [str(col).strip() for col in df.columns]
-        if df.empty or len(df) < 10: return pd.DataFrame()
-        
-        df['SMA_100'] = df['Close'].rolling(window=100).mean()
-        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        if df.empty or len(df) < 100: return pd.DataFrame()
+        df['SMA_100'] = df['Close'].rolling(100).mean()
+        df['SMA_200'] = df['Close'].rolling(200).mean()
         df['RSI'] = ta.rsi(df['Close'], length=14)
-        adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-        if adx_data is not None:
-            df['ADX'] = adx_data['ADX_14']
-        
-        df.dropna(inplace=True)
-        return df.bfill().ffill()
+        adx = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+        if adx is not None: df['ADX'] = adx['ADX_14']
+        return df.dropna().ffill().bfill()
     except: return pd.DataFrame()
 
-# 5. INTERFAZ
-st.set_page_config(page_title="StockAI V6 Ultra Pro", layout="wide")
-st.title("🤖 Stock-AI Predictor V6 - M.L. LSTM Model")
+def predict_ensemble_stable(df, strength):
+    try:
+        feats = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA_100', 'SMA_200', 'RSI', 'ADX']
+        sc = RobustScaler()
+        scaled = sc.fit_transform(df[feats].values)
+        win = scaled[-60:].reshape(1, 60, len(feats)).astype(np.float32)
+        
+        weights = {"m1_puro": 0.30, "m3_tendencia": 0.25, "m2_volatilidad": 0.15, "m4_memoria": 0.15, "m5_agresivo": 0.15}
+        preds, weighted_sum, total_weight = [], 0, 0
+        
+        for name, model in expertos_dict.items():
+            p = model(win, training=False)
+            val = float(p[0][0])
+            preds.append(val)
+            w = weights.get(name, 0.20)
+            weighted_sum += val * w
+            total_weight += w
+        
+        avg_pred = weighted_sum / total_weight
+        curr_p = float(df['Close'].iloc[-1])
+        vol = df['Close'].pct_change().std()
+        z_score = (avg_pred - np.mean(scaled[:, 3])) / (np.std(scaled[:, 3]) + 1e-9)
+        p_final = curr_p * (1 + (z_score * vol * strength))
+        
+        # Nueva métrica de acuerdo mejorada
+        dispersion = (np.std(preds) / (np.mean(preds) + 1e-9)) * 100
+        acuerdo = max(0, min(100, 100 - (dispersion * 50)))
+        
+        return p_final, acuerdo
+    except: return None, None
 
-tab1, tab2, tab3 = st.tabs(["📈 Análisis Individual", "🧪 Backtesting Pro", "🚀 Escaneo Maestro"])
+def get_csv_download_link(df):
+    return df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+
+def actualizar_memoria_errores():
+    if not st.session_state.historial_consultas.empty:
+        hist = st.session_state.historial_consultas
+        for _, row in hist.iterrows():
+            df_now = get_data(row['Activo'], row['TF'])
+            if not df_now.empty:
+                real = df_now['Close'].iloc[-1]
+                err = ((row['Predicción'] - real) / real) * 100
+                save_bias(row['Activo'], err, row['TF'])
+        st.sidebar.success("✅ Sesgos actualizados")
+
+# --- INTERFAZ ---
+st.title("🤖 Stock-AI Predictor V6_Beta PRO")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
     ticker_main = st.text_input("Símbolo Principal:", value="NQ=F").upper()
     tf_main = st.selectbox("Temporalidad:", ["Daily", "Weekly", "Monthly"])
-    fuerza_global = st.slider("Sensibilidad:", 0.1, 1.0, 0.4)
+    fuerza = st.slider("Sensibilidad:", 0.1, 1.0, 0.4)
+    
+    st.divider()
+    st.subheader("🧠 Aprendizaje V3")
+    if st.button("🔄 Sincronizar Sesgos (Ayer/Hoy)"):
+        actualizar_memoria_errores()
+        st.rerun()
+    
+    bias_map = load_bias()
+    current_b = get_current_bias(ticker_main, tf_main)
+    st.info(f"Sesgo en {tf_main} en {ticker_main}: {current_b:+.2f}%")
+    st.write(f"Modelos Activos: {len(expertos_dict)}/5")
 
-df = get_data(ticker_main, tf_main)
+tab1, tab2, tab3 = st.tabs(["📊 Análisis Individual", "🧪 Backtesting Pro", "🚀 Escaneo Maestro"])
 
-# --- TAB 1: ANÁLISIS INDIVIDUAL ---
 with tab1:
+    df = get_data(ticker_main, tf_main)
     if not df.empty:
         df_f = df.tail(150)
-        curr_p = float(df['Close'].iloc[-1])
-        fig = go.Figure(data=[go.Candlestick(x=df_f.index, open=df_f['Open'], high=df_f['High'], low=df_f['Low'], close=df_f['Close'], name=ticker_main)])
-        fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=400)
+        fig = go.Figure(data=[go.Candlestick(x=df_f.index, open=df_f['Open'], high=df_f['High'], low=df_f['Low'], close=df_f['Close'])])
+        fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=400, margin=dict(l=0,r=0,t=0,b=0))
         st.plotly_chart(fig, use_container_width=True)
 
-        if st.button("🚀 Consultar Comité"):
-            scaler = RobustScaler()
-            features = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA_100', 'SMA_200', 'RSI', 'ADX']
-            scaled_data = scaler.fit_transform(df[features].values)
-            last_window = scaled_data[-60:].reshape(1, 60, len(features))
-            preds_raw = [m.predict(last_window, verbose=0)[0][0] for m in model_committee]
-            
-            vol = df['Close'].pct_change().std()
-            z_score = (np.mean(preds_raw) - np.mean(scaled_data[:, 3])) / (np.std(scaled_data[:, 3]) + 1e-9)
-            pred_final = curr_p * (1 + (z_score * vol * fuerza_global))
-            acuerdo_val = max(0, 100-(np.std(preds_raw)*1000))
-            
-            registro = {
-                "Fecha Consulta": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "Activo": ticker_main,
-                "Temporalidad": tf_main,
-                "Precio Cierre": round(curr_p, 4),
-                "Predicción": round(pred_final, 4),
-                "Dirección": "⬆️ ALZA" if pred_final > curr_p else "⬇️ BAJA",
-                "Acuerdo %": f"{acuerdo_val:.1f}%"
-            }
-            st.session_state.bitacora_individual.append(registro)
-            
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Precio Actual", f"{curr_p:.2f}")
-            m2.metric("Target", f"{pred_final:.2f}", f"{pred_final-curr_p:+.2f}")
-            m3.metric("Confianza", f"{acuerdo_val:.1f}%")
+        if st.button("🚀 Ejecutar Predicción Beta", key="run_main"):
+            p_raw, a_val = predict_ensemble_stable(df, fuerza)
+            if p_raw:
+                # APLICAR CAPA DE CORRECCIÓN RESIDUAL
+                p_final = p_raw * (1 - (current_b / 100))
+                
+                curr_p = float(df['Close'].iloc[-1])
+                potencial = ((p_final - curr_p) / curr_p) * 100
+                direccion = "🚀 COMPRA" if p_final > curr_p else "📉 VENTA"
+                precision = 4 if curr_p < 20 else 2
+                
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Precio Actual", f"{curr_p:.{precision}f}")
+                c2.metric("Target Corregido", f"{p_final:.{precision}f}", f"{potencial:+.2f}%")
+                c3.metric("Acuerdo Beta", f"{a_val:.1f}%")
+                c4.metric("Sesgo Aplicado", f"{current_b:+.2f}%", "🎯" if abs(current_b)<0.5 else "⚠️")
+                
+                st.markdown(f"**Dirección Sugerida:** {direccion}")
+                
+                nueva_fila = pd.DataFrame([{
+                    "Fecha": datetime.now().strftime("%H:%M:%S"), "Activo": ticker_main,
+                    "TF": tf_main, "Precio": round(curr_p, precision),
+                    "Predicción": round(p_final, precision), "Dirección": direccion,
+                    "Potencial %": round(potencial, 2), "Acuerdo %": round(a_val, 1)
+                }])
+                st.session_state.historial_consultas = pd.concat([nueva_fila, st.session_state.historial_consultas], ignore_index=True)
 
-        if st.session_state.bitacora_individual:
+        if not st.session_state.historial_consultas.empty:
             st.divider()
-            st.subheader("📋 Consultas Recientes")
-            df_individual = pd.DataFrame(st.session_state.bitacora_individual)
-            st.dataframe(df_individual, use_container_width=True)
-            st.download_button("📥 Descargar Consultas (CSV)", df_individual.to_csv(index=False), "consultas_individuales.csv", "text/csv")
+            st.subheader("📋 Historial de Sesión")
+            st.dataframe(st.session_state.historial_consultas, use_container_width=True)
+            col_s, col_c = st.columns([1, 4])
+            col_s.download_button("📥 Guardar CSV", get_csv_download_link(st.session_state.historial_consultas), f"consultas_{datetime.now().strftime('%H%M')}.csv", "text/csv")
+            if col_c.button("🗑️ Limpiar"):
+                st.session_state.historial_consultas = pd.DataFrame(columns=st.session_state.historial_consultas.columns)
+                st.rerun()
 
-# --- TAB 2: BACKTESTING ---
 with tab2:
+    st.subheader("🧪 Simulación Histórica (m1_puro)")
     if not df.empty:
-        test_days = st.number_input("Velas de prueba:", 5, 200, 30)
-        if st.button("📊 Correr Backtest"):
-            # 1. Inicializar barra de progreso y estado
-            progreso_bt = st.progress(0)
-            status_bt = st.empty()
-            
-            scaler = RobustScaler()
-            features = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA_100', 'SMA_200', 'RSI', 'ADX']
-            scaled = scaler.fit_transform(df[features].values)
-            
-            hits, bt_log = [], []
-            
-            # Definimos el rango para calcular el progreso
-            rango_indices = range(len(scaled) - test_days, len(scaled))
-            total_pasos = len(rango_indices)
-            
-            for idx, i in enumerate(rango_indices):
-                # 2. Actualizar visualización
-                status_bt.text(f"⏳ Procesando vela {idx + 1} de {total_pasos}...")
-                
-                window = scaled[i-60:i].reshape(1, 60, len(features))
-                preds = [m.predict(window, verbose=0)[0][0] for m in model_committee]
-                pred_dir = 1 if (np.mean(preds) > scaled[i-1, 3]) else -1
-                real_dir = 1 if (scaled[i, 3] > scaled[i-1, 3]) else -1
-                hit = 1 if pred_dir == real_dir else 0
-                hits.append(hit)
-                
-                bt_log.append({
-                    "Fecha": df.index[i].strftime("%Y-%m-%d"),
-                    "Activo": ticker_main,
-                    "Dirección Pred": "ALZA" if pred_dir == 1 else "BAJA",
-                    "Dirección Real": "ALZA" if real_dir == 1 else "BAJA",
-                    "Resultado": "✅" if hit == 1 else "❌"
-                })
-                
-                # 3. Mover la barra
-                progreso_bt.progress((idx + 1) / total_pasos)
+        test_days = st.number_input("Velas de prueba:", 5, 100, 20)
+        if st.button("📊 Correr Backtest", key="run_bt"):
+            hits, log = [], []
+            prog = st.progress(0)
+            feats = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA_100', 'SMA_200', 'RSI', 'ADX']
+            sc = RobustScaler()
+            scaled = sc.fit_transform(df[feats].values)
+            model_bt = expertos_dict.get("m1_puro")
+            if model_bt:
+                rango = range(len(scaled) - test_days, len(scaled))
+                for idx, i in enumerate(rango):
+                    win = scaled[i-60:i].reshape(1, 60, len(feats)).astype(np.float32)
+                    p_val = float(model_bt(win, training=False)[0][0])
+                    p_dir = "ALZA" if p_val > scaled[i-1, 3] else "BAJA"
+                    r_dir = "ALZA" if scaled[i, 3] > scaled[i-1, 3] else "BAJA"
+                    hit = 1 if p_dir == r_dir else 0
+                    hits.append(hit)
+                    log.append({"Fecha": df.index[i].strftime("%Y-%m-%d"), "Pred": p_dir, "Real": r_dir, "Hit": "✅" if hit else "❌"})
+                    prog.progress((idx+1)/len(rango))
+                st.success(f"Efectividad: {(sum(hits)/len(hits))*100:.1f}%")
+                st.dataframe(pd.DataFrame(log), use_container_width=True)
 
-            # Limpiar texto de estado y mostrar éxito
-            status_bt.empty()
-            df_bt_results = pd.DataFrame(bt_log)
-            st.success(f"✅ Backtest completado. Efectividad: {(sum(hits)/len(hits))*100:.1f}%")
-            
-            st.dataframe(df_bt_results, use_container_width=True)
-            st.download_button("📥 Descargar Reporte Backtesting", df_bt_results.to_csv(index=False), f"backtest_{ticker_main}.csv", "text/csv")
-
-# --- TAB 3: ESCANEO MAESTRO (Versión Inteligente V6) ---
 with tab3:
-    st.subheader("🚀 Escaneo Multiactivo de Alto Rendimiento")
-    
-    # Área de entrada de Tickers
-    lista_raw = st.text_area("Lista de Tickers (Copia y pega desde Excel o texto):", 
-                             value="AAPL, NVDA, MSFT, TSLA, BTC-USD, ETH-USD, NQ=F, ES=F, GC=F, CL=F, EURUSD=X", 
-                             height=120)
-    
-    col_f1, col_f2 = st.columns(2)
-    umbral_min = col_f1.slider("Filtrar por Acuerdo mínimo (%):", 0, 100, 30)
-    sort_by = col_f2.selectbox("Ordenar resultados por:", ["Acuerdo %", "Potencial %"])
-    
-    if st.button("🔍 Iniciar Escaneo Maestro"):
-        import time
-        start_time = time.time()
+    st.subheader("🚀 Escaneo Maestro (347 Activos)")
+    lista = st.text_area("Lista de Tickers:", value="AAPL, NVDA, BTC-USD, NQ=F, EURUSD=X", height=100)
+    if st.button("🔍 Iniciar Escaneo"):
+        tickers = [t.strip().upper() for t in lista.split(",") if t.strip()]
+        results = []
+        bar = st.progress(0)
         
-        tickers = [t.strip().replace(",", "").upper() for t in lista_raw.replace("\n", " ").split() if t.strip()]
-        resultados_escaneo = []
-        progreso = st.progress(0)
-        status_text = st.empty()
+        # Cargamos sesgos una sola vez para velocidad
+        bias_map = load_bias()
         
         for idx, t in enumerate(tickers):
-            status_text.text(f"⏳ Analizando {idx+1}/{len(tickers)}: {t}")
             df_t = get_data(t, tf_main)
-            
             if not df_t.empty and len(df_t) >= 65:
-                # 🧠 Inferencia del Comité
-                sc = RobustScaler()
-                feats = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA_100', 'SMA_200', 'RSI', 'ADX']
-                scaled_t = sc.fit_transform(df_t[feats].values)
-                win = scaled_t[-60:].reshape(1, 60, len(feats))
-                preds = [m.predict(win, verbose=0)[0][0] for m in model_committee]
-                
-                cp = float(df_t['Close'].iloc[-1])
-                vol = df_t['Close'].pct_change().std()
-                zs = (np.mean(preds) - np.mean(scaled_t[:, 3])) / (np.std(scaled_t[:, 3]) + 1e-9)
-                pf = cp * (1 + (zs * vol * fuerza_global))
-                
-                # Cálculos Clave
-                ac_raw = max(0, 100 - (np.std(preds) * 1000))
-                potencial = ((pf - cp) / cp) * 100
-                
-                if ac_raw >= umbral_min:
-                    resultados_escaneo.append({
+                pf_raw, av = predict_ensemble_stable(df_t, fuerza)
+                if pf_raw:
+                    # Buscamos el sesgo específico para este Ticker y este TF
+                    t_bias = bias_map.get(f"{t}_{tf_main}", 0.0)
+                    pf = pf_raw * (1 - (t_bias / 100))
+                    cp = df_t['Close'].iloc[-1]
+                    precision = 4 if cp < 20 else 2
+                    pot = ((pf - cp) / cp) * 100
+                    
+                    # 1. Guardamos para el CSV (Formato antiguo restaurado)
+                    res_row = {
                         "Fecha": datetime.now().strftime("%H:%M"),
                         "Activo": t,
-                        "TF": tf_main, # <--- ESTA ES LA QUE TE FALTABA
-                        "Precio": round(cp, 4),
-                        "Predicción": round(pf, 4),
+                        "TF": tf_main,
+                        "Precio Cierre": round(cp, precision),
+                        "Predicción": round(pf, precision),
                         "Dirección": "🚀 COMPRA" if pf > cp else "📉 VENTA",
-                        "Potencial %": round(potencial, 2),
-                        "Acuerdo %": round(ac_raw, 1)
-                    })
-            progreso.progress((idx + 1) / len(tickers))
+                        "Potencial %": round(pot, 2),
+                        "Acuerdo %": round(av, 1),
+                        "Sesgo %": round(t_bias, 2)
+                    }
+                    results.append(res_row)
+
+                    # 2. ALIMENTAR EL HISTORIAL (Para que el botón de Sincronizar aprenda de estos 300)
+                    nueva_fila_h = pd.DataFrame([{
+                        "Fecha": res_row["Fecha"], "Activo": t, "TF": tf_main,
+                        "Precio": round(cp, precision), "Predicción": round(pf, precision),
+                        "Dirección": res_row["Dirección"], "Potencial %": res_row["Potencial %"],
+                        "Acuerdo %": res_row["Acuerdo %"]
+                    }])
+                    st.session_state.historial_consultas = pd.concat([st.session_state.historial_consultas, nueva_fila_h], ignore_index=True)
+
+            bar.progress((idx+1)/len(tickers))
         
-        end_time = time.time()
-        total_time = end_time - start_time
-        status_text.success(f"⚡ Escaneo de {len(tickers)} activos completado en {total_time:.1f}s")
-
-
-        # --- Bloque de Visualización y Descarga (Fuera del bucle) ---
-        if resultados_escaneo:
-            df_res = pd.DataFrame(resultados_escaneo)
-            
-            # Ordenar dinámicamente
-            sort_col = "Acuerdo %" if sort_by == "Acuerdo %" else "Potencial %"
-            df_res = df_res.sort_values(by=sort_col, ascending=False)
-            
-            # Estilos robustos
-            def style_v6(row):
-                styles = [''] * len(row)
-                cols = list(row.index)
-                
-                if "Dirección" in cols:
-                    idx = cols.index("Dirección")
-                    styles[idx] = 'color: #00ff00; font-weight: bold;' if "COMPRA" in row["Dirección"] else 'color: #ff4b4b; font-weight: bold;'
-                
-                if "Acuerdo %" in cols:
-                    idx = cols.index("Acuerdo %")
-                    if row["Acuerdo %"] > 55: styles[idx] = 'background-color: #1e3d24; color: #ffffff;'
-                
-                if "Potencial %" in cols:
-                    idx = cols.index("Potencial %")
-                    if abs(row["Potencial %"]) > 2.0: styles[idx] = 'color: #00d4ff; font-weight: bold;'
-                
-                return styles
-
-            st.subheader(f"📊 Ranking de Oportunidades ({tf_main})")
-            
-            # Renderizar la tabla
-            st.dataframe(
-                df_res.style.apply(style_v6, axis=1),
-                use_container_width=True
-            )
-            
-            # --- BOTÓN DE DESCARGA (Restaurado) ---
-            csv = df_res.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Descargar Reporte Maestro (CSV)",
-                data=csv,
-                file_name=f"escaneo_{tf_main}_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
-
-           
+        if results:
+            df_res = pd.DataFrame(results).sort_values("Acuerdo %", ascending=False)
+            st.dataframe(df_res, use_container_width=True)
+            st.download_button("📥 Reporte Maestro", get_csv_download_link(df_res), f"escaneo_v6_pro_{datetime.now().strftime('%Y%m%d')}.csv")
