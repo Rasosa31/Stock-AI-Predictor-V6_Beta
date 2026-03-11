@@ -25,7 +25,7 @@ st.set_page_config(page_title="StockAI V6_Beta PRO", layout="wide")
 # --- GESTIÓN DE SESGO (BIAS MEMORY) ---
 BIAS_FILE = "bias_memory.json"
 
-# --- BUSCA Y REEMPLAZA ESTAS FUNCIONES ---
+
 def load_bias():
     if os.path.exists(BIAS_FILE):
         try:
@@ -66,6 +66,10 @@ def actualizar_memoria_errores():
                 err = ((row['Predicción'] - real) / real) * 100
                 save_bias(row['Activo'], err, row['TF'])
         st.sidebar.success(f"✅ Memoria D/W/M actualizada")
+
+# --- INICIALIZACIÓN DE MEMORIA DE ESCANEO ---
+if 'resultados_escaneo' not in st.session_state:
+    st.session_state.resultados_escaneo = None
 
 # --- INICIALIZACIÓN DE MEMORIA (HISTORIAL) ---
 if 'historial_consultas' not in st.session_state:
@@ -249,12 +253,13 @@ with tab2:
 with tab3:
     st.subheader("🚀 Escaneo Maestro (347 Activos)")
     lista = st.text_area("Lista de Tickers:", value="AAPL, NVDA, BTC-USD, NQ=F, EURUSD=X", height=100)
-    if st.button("🔍 Iniciar Escaneo"):
+    
+    col_acc1, col_acc2 = st.columns(2)
+    
+    if col_acc1.button("🔍 Iniciar Escaneo", key="btn_scan_start"):
         tickers = [t.strip().upper() for t in lista.split(",") if t.strip()]
         results = []
         bar = st.progress(0)
-        
-        # Cargamos sesgos una sola vez para velocidad
         bias_map = load_bias()
         
         for idx, t in enumerate(tickers):
@@ -262,14 +267,12 @@ with tab3:
             if not df_t.empty and len(df_t) >= 65:
                 pf_raw, av = predict_ensemble_stable(df_t, fuerza)
                 if pf_raw:
-                    # Buscamos el sesgo específico para este Ticker y este TF
                     t_bias = bias_map.get(f"{t}_{tf_main}", 0.0)
                     pf = pf_raw * (1 - (t_bias / 100))
                     cp = df_t['Close'].iloc[-1]
                     precision = 4 if cp < 20 else 2
                     pot = ((pf - cp) / cp) * 100
                     
-                    # 1. Guardamos para el CSV (Formato antiguo restaurado)
                     res_row = {
                         "Fecha": datetime.now().strftime("%H:%M"),
                         "Activo": t,
@@ -283,7 +286,7 @@ with tab3:
                     }
                     results.append(res_row)
 
-                    # 2. ALIMENTAR EL HISTORIAL (Para que el botón de Sincronizar aprenda de estos 300)
+                    # Alimentar el historial global para la sincronización
                     nueva_fila_h = pd.DataFrame([{
                         "Fecha": res_row["Fecha"], "Activo": t, "TF": tf_main,
                         "Precio": round(cp, precision), "Predicción": round(pf, precision),
@@ -294,7 +297,24 @@ with tab3:
 
             bar.progress((idx+1)/len(tickers))
         
+        # GUARDAR EN SESSION STATE PARA PERSISTENCIA
         if results:
-            df_res = pd.DataFrame(results).sort_values("Acuerdo %", ascending=False)
-            st.dataframe(df_res, use_container_width=True)
-            st.download_button("📥 Reporte Maestro", get_csv_download_link(df_res), f"escaneo_v6_pro_{datetime.now().strftime('%Y%m%d')}.csv")
+            st.session_state.resultados_escaneo = pd.DataFrame(results).sort_values("Acuerdo %", ascending=False)
+
+    # MOSTRAR RESULTADOS SI EXISTEN EN LA SESIÓN
+    if st.session_state.resultados_escaneo is not None:
+        st.divider()
+        st.dataframe(st.session_state.resultados_escaneo, use_container_width=True)
+        
+        c_down, c_clear = st.columns([1, 4])
+        with c_down:
+            st.download_button(
+                label="📥 Descargar Reporte",
+                data=get_csv_download_link(st.session_state.resultados_escaneo),
+                file_name=f"escaneo_{tf_main}_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        with c_clear:
+            if st.button("🗑️ Limpiar Tabla de Escaneo"):
+                st.session_state.resultados_escaneo = None
+                st.rerun()
